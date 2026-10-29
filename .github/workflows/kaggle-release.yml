@@ -82,14 +82,19 @@ jobs:
           ls -lhR kaggle_output
 
       - name: Prepare Files for Release
+        id: prep
         run: |
           mkdir -p release_assets
-          find kaggle_output -type f -exec cp -v {} release_assets/ \;
+          # کپی فایل‌ها با این شرط که حجم آن‌ها بزرگ‌تر از صفر باشد (حذف فایل‌های خالی)
+          find kaggle_output -type f -size +0c -exec cp -v {} release_assets/ \;
+          
+          # حذف فایل‌های متنی یا لاگ خالی اگر احیاناً باقی مانده باشند
+          find release_assets -type f -empty -delete
           
           FILE_COUNT=$(ls -1 release_assets | wc -l)
-          echo "Total files found: $FILE_COUNT"
+          echo "Total valid files found: $FILE_COUNT"
           if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "❌ هیچ فایلی از خروجی کگل دریافت نشد!"
+            echo "❌ هیچ فایل معتبری با حجم بیشتر از صفر برای رلیز پیدا نشد!"
             exit 1
           fi
           ls -lh release_assets/
