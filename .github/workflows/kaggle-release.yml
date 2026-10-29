@@ -1,0 +1,73 @@
+name: Kaggle Build → Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      push_kernel:
+        description: "Kernel رو قبل از دانلود دوباره اجرا کن (kaggle kernels push)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 */6 * * *"   # اختیاری؛ اگه نمی‌خوای حذفش کن
+
+permissions:
+  contents: write
+
+env:
+  KERNEL: thequestions/orangefox-kaggle-fast-build
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle
+
+      - name: Setup Kaggle credentials
+        run: |
+          mkdir -p ~/.kaggle
+          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Check kernel status
+        id: status
+        run: |
+          out=$(kaggle kernels status "$KERNEL")
+          echo "$out"
+          if echo "$out" | grep -qi "complete"; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "ok=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download output
+        if: steps.status.outputs.ok == 'true'
+        run: |
+          mkdir -p out
+          kaggle kernels output "$KERNEL" -p out
+          ls -lhR out
+
+      - name: Collect build files
+        if: steps.status.outputs.ok == 'true'
+        id: collect
+        run: |
+          # فایل‌های خروجی recovery رو پیدا کن (zip و img)
+          mkdir -p dist
+          find out -type f \( -name "OrangeFox*.zip" -o -name "*.img" -o -name "*.zip" \) -exec cp {} dist/ \;
+          if [ -z "$(ls -A dist)" ]; then
+            echo "هیچ فایل خروجی پیدا نشد"; exit 1
+          fi
+          cd dist && sha256sum * > SHA256SUMS.txt
+          echo "tag=build-$(date -u +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
+
+      - name: Create release
+        if: steps.status.outputs.ok == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.collect.outputs.tag }}
+          name: OrangeFox zahedan ${{ steps.collect.outputs.tag }}
+          body: |
+            Built on Kaggle: https://www.kaggle.com/code/${{ env.KERNEL }}
+          files: dist/*
