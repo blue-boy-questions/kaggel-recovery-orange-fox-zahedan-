@@ -1,73 +1,109 @@
-name: Kaggle Build → Release
+name: Publish Kaggle Output to GitHub Release
 
 on:
   workflow_dispatch:
     inputs:
-      push_kernel:
-        description: "Kernel رو قبل از دانلود دوباره اجرا کن (kaggle kernels push)"
+      kaggle_username:
+        description: 'نام کاربری کگل شما (اختیاری - اگر در ابتدای kernel_slug باشد خودکار برداشته می‌شود)'
+        required: false
+        default: ''
+      kernel_slug:
+        description: 'آدرس نوت‌بوک در کگل (فرمت: username/notebook-slug)'
+        required: true
+        default: 'username/orangefox-kaggle'
+      release_tag:
+        description: 'تگ رلیز در گیت‌هاب (مثلاً v1.0-ofox)'
+        required: true
+        default: 'v1.0-ofox'
+      wait_for_completion:
+        description: 'اگر نوت‌بوک هنوز در حال اجراست، صبر کند تا تمام شود؟'
+        required: false
         type: boolean
-        default: false
-  schedule:
-    - cron: "0 */6 * * *"   # اختیاری؛ اگه نمی‌خوای حذفش کن
+        default: true
 
 permissions:
   contents: write
 
-env:
-  KERNEL: thequestions/orangefox-kaggle-fast-build
-
 jobs:
-  release:
+  release-kaggle-output:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
       - name: Install Kaggle CLI
-        run: pip install kaggle
+        run: pip install --upgrade kaggle
 
-      - name: Setup Kaggle credentials
+      - name: Configure Kaggle Credentials & Wait/Download Output
+        env:
+          KAGGLE_KEY_SECRET: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_USER_SECRET: ${{ secrets.KAGGLE_USERNAME }}
+          INPUT_USER: ${{ github.event.inputs.kaggle_username }}
+          KERNEL_SLUG: ${{ github.event.inputs.kernel_slug }}
+          WAIT_COMPLETE: ${{ github.event.inputs.wait_for_completion }}
         run: |
           mkdir -p ~/.kaggle
-          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
-
-      - name: Check kernel status
-        id: status
-        run: |
-          out=$(kaggle kernels status "$KERNEL")
-          echo "$out"
-          if echo "$out" | grep -qi "complete"; then
-            echo "ok=true" >> $GITHUB_OUTPUT
+          
+          # بررسی اینکه آیا KAGGLE_KEY خودش یک JSON کامل است یا فقط رشته کلید
+          if echo "$KAGGLE_KEY_SECRET" | grep -q '"username"'; then
+            echo "$KAGGLE_KEY_SECRET" > ~/.kaggle/kaggle.json
           else
-            echo "ok=false" >> $GITHUB_OUTPUT
+            K_USER="${INPUT_USER:-$KAGGLE_USER_SECRET}"
+            if [ -z "$K_USER" ]; then
+              K_USER=$(echo "$KERNEL_SLUG" | cut -d'/' -f1)
+            fi
+            printf '{"username":"%s","key":"%s"}\n' "$K_USER" "$KAGGLE_KEY_SECRET" > ~/.kaggle/kaggle.json
           fi
-
-      - name: Download output
-        if: steps.status.outputs.ok == 'true'
-        run: |
-          mkdir -p out
-          kaggle kernels output "$KERNEL" -p out
-          ls -lhR out
-
-      - name: Collect build files
-        if: steps.status.outputs.ok == 'true'
-        id: collect
-        run: |
-          # فایل‌های خروجی recovery رو پیدا کن (zip و img)
-          mkdir -p dist
-          find out -type f \( -name "OrangeFox*.zip" -o -name "*.img" -o -name "*.zip" \) -exec cp {} dist/ \;
-          if [ -z "$(ls -A dist)" ]; then
-            echo "هیچ فایل خروجی پیدا نشد"; exit 1
+          
+          chmod 600 ~/.kaggle/kaggle.json
+          
+          # بررسی وضعیت نوت‌بوک تا اتمام اجرا
+          if [ "$WAIT_COMPLETE" = "true" ]; then
+            echo "⏳ Checking kernel status for: $KERNEL_SLUG ..."
+            for i in {1..180}; do
+              STATUS=$(kaggle kernels status "$KERNEL_SLUG" 2>&1 || true)
+              echo "[$i] $STATUS"
+              if echo "$STATUS" | grep -qi "complete"; then
+                echo "✅ Kernel execution completed!"
+                break
+              elif echo "$STATUS" | grep -qiE "error|cancel"; then
+                echo "⚠️ Kernel finished with error/cancel status. Fetching available outputs/logs..."
+                break
+              fi
+              sleep 60
+            done
           fi
-          cd dist && sha256sum * > SHA256SUMS.txt
-          echo "tag=build-$(date -u +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
+          
+          echo "📥 Downloading outputs from Kaggle kernel: $KERNEL_SLUG ..."
+          mkdir -p kaggle_output
+          kaggle kernels output "$KERNEL_SLUG" -p kaggle_output
+          
+          echo "📂 Downloaded files Structure:"
+          ls -lhR kaggle_output
 
-      - name: Create release
-        if: steps.status.outputs.ok == 'true'
+      - name: Prepare Files for Release
+        run: |
+          mkdir -p release_assets
+          find kaggle_output -type f -exec cp -v {} release_assets/ \;
+          
+          FILE_COUNT=$(ls -1 release_assets | wc -l)
+          echo "Total files found: $FILE_COUNT"
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "❌ هیچ فایلی از خروجی کگل دریافت نشد!"
+            exit 1
+          fi
+          ls -lh release_assets/
+
+      - name: Create GitHub Release & Upload Assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.collect.outputs.tag }}
-          name: OrangeFox zahedan ${{ steps.collect.outputs.tag }}
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: "OrangeFox Recovery (${{ github.event.inputs.release_tag }})"
           body: |
-            Built on Kaggle: https://www.kaggle.com/code/${{ env.KERNEL }}
-          files: dist/*
+            ### 🦊 خروجی استخراج‌شده از کگل (`${{ github.event.inputs.kernel_slug }}`)
+            * **تگ بیلد:** `${{ github.event.inputs.release_tag }}`
+          files: release_assets/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
